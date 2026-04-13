@@ -1,0 +1,7 @@
+{
+  "assistant_name": "Philipedia",
+  "wake_phrase": "Sir Philip",
+  "voice_en": "en_GB-alan-medium",
+  "voice_da": "da_DK-talesyntese-medium",
+  "volume": 0.5
+}

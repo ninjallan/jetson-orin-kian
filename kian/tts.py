@@ -1,17 +1,16 @@
-"""Text-to-speech using Piper with playback thread."""
+"""Text-to-speech using Piper with language-aware voice selection."""
 
 import asyncio
 import queue
-import random
 import re
 import threading
 import time
 import wave
+from pathlib import Path
 
 import numpy as np
 import pulsectl
 import sounddevice as sd
-from pathlib import Path
 from piper import PiperVoice
 from piper.config import SynthesisConfig
 
@@ -20,11 +19,8 @@ from kian.latex_to_speech import latex_to_speech
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MODELS_DIR = PROJECT_ROOT / "models"
-TTS_SAMPLE_RATE = 22050  # Piper default
+TTS_SAMPLE_RATE = 22050
 
-VOICES = list(MODELS_DIR.glob("en_*-medium.onnx"))
-
-# Volume presets (PulseAudio 0.0–1.0)
 VOLUME_WHISPER = 0.30
 VOLUME_INSIDE = 0.50
 VOLUME_LOUD = 0.80
@@ -34,32 +30,33 @@ VOLUME_SHOUT = 1.0
 class TTSPlayer:
     """Synthesizes text and plays audio via a background thread."""
 
-    def __init__(self, model_path: str | None = None,
-                 speed: float = 1.0, pitch_shift: float = 1.0):
-        if model_path is None:
-            model_path = self._resolve_voice()
-        self._model_path = Path(model_path)
-        print(f"[TTS] voice: {self._model_path.stem}")
-        self._voice = PiperVoice.load(model_path)
+    def __init__(self, speed: float = 1.0, pitch_shift: float = 1.0):
+        self._voice_cache: dict[str, PiperVoice] = {}
+        self._voice_paths = {
+            "en": self._resolve_voice(getattr(llm_mod, "voice_en", "en_GB-alan-medium")),
+            "da": self._resolve_voice(getattr(llm_mod, "voice_da", "da_DK-talesyntese-medium")),
+        }
+        print(f"[TTS] English voice: {self._voice_paths['en'].stem}")
+        print(f"[TTS] Danish voice: {self._voice_paths['da'].stem}")
         self._syn_config = SynthesisConfig(length_scale=1.0 / speed)
-        self._playback_rate = int(TTS_SAMPLE_RATE * pitch_shift)  # higher = raised pitch
-        self._volume = 1.0  # 0.0–2.0
+        self._playback_rate = int(TTS_SAMPLE_RATE * pitch_shift)
         self._beep_audio = self._load_beep()
         self._audio_queue: queue.Queue[np.ndarray | None] = queue.Queue()
         self._playback_thread = threading.Thread(target=self._playback_worker, daemon=True)
         self._playback_thread.start()
 
     @staticmethod
-    def _resolve_voice() -> str:
-        """Return saved voice path if valid, otherwise pick randomly."""
-        if llm_mod.voice:
-            matches = [v for v in VOICES if v.stem == llm_mod.voice]
-            if matches:
-                return str(matches[0])
-        chosen = random.choice(VOICES)
-        llm_mod.voice = chosen.stem
-        llm_mod.save_settings()
-        return str(chosen)
+    def _resolve_voice(stem: str) -> Path:
+        path = MODELS_DIR / f"{stem}.onnx"
+        if not path.exists():
+            raise FileNotFoundError(f"Missing Piper voice model: {path}")
+        return path
+
+    def _load_voice(self, language: str) -> PiperVoice:
+        key = "da" if language.lower().startswith("da") else "en"
+        if key not in self._voice_cache:
+            self._voice_cache[key] = PiperVoice.load(str(self._voice_paths[key]))
+        return self._voice_cache[key]
 
     @staticmethod
     def _load_beep() -> np.ndarray:
@@ -70,15 +67,7 @@ class TTSPlayer:
         return audio
 
     def _playback_worker(self):
-        """Play audio chunks via a persistent output stream.
-
-        The stream stays open for the lifetime of the worker so there
-        is no per-chunk startup latency (which caused cut-off of the
-        first milliseconds) and no repeated open/close (which caused
-        ALSA underruns).  When idle the stream outputs silence via the
-        callback, so the buffer never starves.
-        """
-        self._play_buf: list[np.ndarray] = []  # chunks waiting to be played
+        self._play_buf: list[np.ndarray] = []
         self._play_lock = threading.Lock()
 
         def _callback(outdata, frames, time_info, status):
@@ -93,14 +82,16 @@ class TTSPlayer:
                     else:
                         self._play_buf.pop(0)
                     written += n
-            # Fill remainder with silence — keeps the stream fed
             if written < frames:
                 outdata[written:, 0] = 0.0
 
-        with sd.OutputStream(samplerate=self._playback_rate, channels=1,
-                             dtype="float32", callback=_callback,
-                             latency="high"):
-            # Let the stream fill its initial buffer with silence
+        with sd.OutputStream(
+            samplerate=self._playback_rate,
+            channels=1,
+            dtype="float32",
+            callback=_callback,
+            latency="high",
+        ):
             time.sleep(0.2)
             while True:
                 chunk = self._audio_queue.get()
@@ -108,7 +99,6 @@ class TTSPlayer:
                     break
                 with self._play_lock:
                     self._play_buf.append(chunk.copy())
-                # Wait for this chunk to finish playing
                 while True:
                     with self._play_lock:
                         if not self._play_buf:
@@ -116,15 +106,16 @@ class TTSPlayer:
                     time.sleep(0.005)
                 self._audio_queue.task_done()
 
-    def _synthesize(self, text: str) -> np.ndarray:
+    def _synthesize(self, text: str, language: str) -> np.ndarray:
+        voice = self._load_voice(language)
         chunks = []
-        for audio_chunk in self._voice.synthesize(text, self._syn_config):
+        for audio_chunk in voice.synthesize(text, self._syn_config):
             chunks.append(audio_chunk.audio_float_array)
-        return np.concatenate(chunks)
+        return np.concatenate(chunks) if chunks else np.zeros(1, dtype=np.float32)
 
-    # Pronunciation overrides: word → how to say it
     PRONUNCIATION = {
-        "Kian": "Key-in",
+        "Philipedia": "Philip eedia",
+        "Sir Philip": "Sir Philip",
         "1920s": "nineteen twenties",
         "1930s": "nineteen thirties",
         "1940s": "nineteen forties",
@@ -134,26 +125,9 @@ class TTSPlayer:
         "1980s": "nineteen eighties",
         "1990s": "nineteen nineties",
     }
-
-    # Forbidden words → safe replacements (matched case-insensitively)
-    WORD_FILTER = {
-        "ass": "donkey",
-        "butt": "behind",
-    }
-    _WORD_FILTER_RE = re.compile(
-        r"\b(" + "|".join(re.escape(w) for w in WORD_FILTER) + r")\b",
-        re.IGNORECASE,
-    )
-
+    WORD_FILTER = {"ass": "donkey", "butt": "behind"}
+    _WORD_FILTER_RE = re.compile(r"\b(" + "|".join(re.escape(w) for w in WORD_FILTER) + r")\b", re.IGNORECASE)
     _DIMENSIONS_RE = re.compile(r"\b(\d+)\s*x\s*(\d+)\b", re.IGNORECASE)
-    # dy/dx → "dee y dee x"; d²y/dx² → "dee two y dee x squared"
-    _DERIVATIVE_RE = re.compile(r"\bd([²³⁴⁵⁶⁷⁸⁹]?)([a-zA-Z])\s*/\s*d([a-zA-Z])([²³⁴⁵⁶⁷⁸⁹]?)\b")
-    _SUPER_TO_WORD = {"²": "squared", "³": "cubed", "⁴": "to the fourth",
-                      "⁵": "to the fifth", "⁶": "to the sixth",
-                      "⁷": "to the seventh", "⁸": "to the eighth",
-                      "⁹": "to the ninth"}
-    _SUPER_TO_NUM = {"²": "two", "³": "three", "⁴": "four", "⁵": "five",
-                     "⁶": "six", "⁷": "seven", "⁸": "eight", "⁹": "nine"}
     _YEAR_19XX_RE = re.compile(r"\b19(\d\d)\b")
 
     def _fix_pronunciation(self, text: str) -> str:
@@ -161,49 +135,27 @@ class TTSPlayer:
         text = text.replace("*", "")
         text = re.sub(r'[\U00010000-\U0010ffff\u2600-\u27bf\u2300-\u23ff\ufe0f]', '', text)
         text = self._DIMENSIONS_RE.sub(r"\1 by \2", text)
-        def _derivative_to_speech(m):
-            order = m.group(1)  # "" or superscript digit
-            num = m.group(2)    # y, f, v, etc.
-            den = m.group(3)    # x, t, etc.
-            den_exp = m.group(4)  # "" or superscript digit
-            if order or den_exp:
-                sup = order or den_exp
-                n = self._SUPER_TO_NUM.get(sup, sup)
-                w = self._SUPER_TO_WORD.get(sup, sup)
-                return f"dee {n} {num} dee {den} {w}"
-            return f"dee {num} dee {den}"
-        text = self._DERIVATIVE_RE.sub(_derivative_to_speech, text)
-        text = self._WORD_FILTER_RE.sub(
-            lambda m: self.WORD_FILTER[m.group(0).lower()], text
-        )
+        text = self._WORD_FILTER_RE.sub(lambda m: self.WORD_FILTER[m.group(0).lower()], text)
         for word, replacement in self.PRONUNCIATION.items():
             text = text.replace(word, replacement)
-        # "1985" → "nineteen 85" (Piper handles "85" → "eighty-five")
         text = self._YEAR_19XX_RE.sub(r"nineteen \1", text)
         return text
 
-    async def speak(self, text: str, tail_silence: float = 0.0):
-        """Synthesize text and queue for playback.
-
-        If tail_silence > 0, silence is appended directly to the audio chunk
-        so the stream stays fed with no gap.
-        """
+    async def speak(self, text: str, language: str = "en", tail_silence: float = 0.0):
         text = self._fix_pronunciation(text)
         if not text.strip():
             return
         loop = asyncio.get_event_loop()
-        audio = await loop.run_in_executor(None, self._synthesize, text)
+        audio = await loop.run_in_executor(None, self._synthesize, text, language)
         if tail_silence > 0:
             silence = np.zeros(int(self._playback_rate * tail_silence), dtype=np.float32)
             audio = np.concatenate([audio, silence])
         self._audio_queue.put(audio)
 
     def beep(self):
-        """Play the beep-boop acknowledgment sound (non-blocking)."""
         self._audio_queue.put(self._beep_audio)
 
     def set_volume(self, level: float, persist: bool = True):
-        """Set system volume via PulseAudio (0.0–1.0)."""
         with pulsectl.Pulse("kian") as pulse:
             sink = pulse.get_sink_by_name(pulse.server_info().default_sink_name)
             pulse.volume_set_all_chans(sink, level)
@@ -212,36 +164,22 @@ class TTSPlayer:
             llm_mod.volume = level
             llm_mod.save_settings()
 
-    def change_voice(self):
-        """Switch to a random different voice and persist."""
-        if len(VOICES) < 2:
-            return
-        others = [v for v in VOICES if v.name != self._model_path.name]
-        chosen = random.choice(others)
-        self._model_path = chosen
-        print(f"[TTS] voice: {chosen.stem}")
-        self._voice = PiperVoice.load(str(chosen))
-        llm_mod.voice = chosen.stem
+    def set_voice(self, language: str, stem: str):
+        key = "da" if language.lower().startswith("da") else "en"
+        path = self._resolve_voice(stem)
+        self._voice_paths[key] = path
+        if key in self._voice_cache:
+            del self._voice_cache[key]
+        if key == "da":
+            llm_mod.voice_da = stem
+        else:
+            llm_mod.voice_en = stem
         llm_mod.save_settings()
-
-    def set_voice(self, stem: str):
-        """Switch to a specific voice by stem name and persist."""
-        matches = [v for v in VOICES if v.stem == stem]
-        if not matches:
-            print(f"[TTS] voice not found: {stem}")
-            return
-        chosen = matches[0]
-        self._model_path = chosen
-        print(f"[TTS] voice: {chosen.stem}")
-        self._voice = PiperVoice.load(str(chosen))
-        llm_mod.voice = chosen.stem
-        llm_mod.save_settings()
+        print(f"[TTS] {key} voice: {stem}")
 
     def flush(self):
-        """Immediately silence playback and discard queued audio."""
         with self._play_lock:
             self._play_buf.clear()
-        # Drain the queue so task_done bookkeeping stays consistent
         while not self._audio_queue.empty():
             try:
                 self._audio_queue.get_nowait()
@@ -250,14 +188,11 @@ class TTSPlayer:
                 break
 
     def drain(self):
-        """Wait for all queued audio to finish playing."""
         self._audio_queue.join()
 
     def reset_synth(self):
-        """Reload the Piper voice model to clear any accumulated state."""
-        self._voice = PiperVoice.load(str(self._model_path))
+        self._voice_cache.clear()
 
     def stop(self):
-        """Signal playback thread to exit and wait for it to finish."""
         self._audio_queue.put(None)
         self._playback_thread.join(timeout=3)

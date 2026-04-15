@@ -1,11 +1,11 @@
 [project]
 name = "kian"
 version = "0.1.0"
-description = "Voice assistant: VAD → Whisper → LLM (llama.cpp or MLC) → Piper TTS"
+description = "Voice assistant: wake word -> VAD -> Whisper -> LLM -> Piper TTS"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 dependencies = [
-    "onnxruntime>=1.17",
+    "onnxruntime==1.17.0",
     "faster-whisper>=1.1.0",
     "llama-cpp-python>=0.3.19",
     "piper-tts>=1.4",
@@ -14,6 +14,7 @@ dependencies = [
     "jetson-gpio>=2.1.12",
     "pulsectl>=24.12.0",
     "tokenizers>=0.15",
+    "openwakeword>=0.6.0",
 ]
 
 [build-system]
@@ -22,6 +23,3 @@ build-backend = "hatchling.build"
 
 [project.scripts]
 kian = "kian.app:main"
-
-# [[tool.uv.index]]
-# url = "https://pypi.jetson-ai-lab.io/jp6/cu126"
